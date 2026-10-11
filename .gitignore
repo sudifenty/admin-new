@@ -1,0 +1,10 @@
+# Local credentials / environment
+.env
+.env.*
+!.env.example
+
+# Generated / local-only files
+.DS_Store
+node_modules/
+dist/
+*.log

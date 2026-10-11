@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Q-A Supabase verification SQL</title>
+<style>
+:root{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#18241d;background:#f4f7f4}*{box-sizing:border-box}body{margin:0;padding:20px}main{max-width:1100px;margin:0 auto;background:#fff;border:1px solid #dbe4dc;border-radius:16px;overflow:hidden;box-shadow:0 8px 28px #1a392414}header{padding:22px 24px;border-bottom:1px solid #e4ebe4}h1{margin:0 0 8px;font-size:22px}p{margin:6px 0;color:#526157;font-size:14px;line-height:1.5}.note{padding:13px 24px;background:#eaf7ee;border-bottom:1px solid #cfe6d5;color:#205a35;font-size:13px;line-height:1.5}.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:14px 24px;border-bottom:1px solid #e4ebe4}button{display:inline-flex;align-items:center;gap:8px;border:1px solid #cfdacf;border-radius:9px;background:#fff;color:#1c3525;font:700 14px system-ui,sans-serif;padding:10px 14px;cursor:pointer}button.primary{background:#176b42;border-color:#176b42;color:#fff}svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}#status{font-size:13px;color:#24633f;min-height:1.4em}textarea{display:block;width:100%;height:min(70vh,900px);min-height:460px;resize:vertical;border:0;background:#111a17;color:#e3f2e9;padding:20px 22px;font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre;outline:none}footer{padding:12px 24px;color:#647166;font-size:12px}@media(max-width:600px){body{padding:8px}header{padding:18px}.note,.toolbar,footer{padding-left:18px;padding-right:18px}textarea{font-size:11px;height:68vh}}
+</style></head><body><main><header><h1>Q-A — Supabase verification SQL</h1><p>This is the <strong>read-only</strong> post-setup check: 197 lines. It verifies scoped profile access, the admin allowlist, RLS/policies, RPCs, and question counts.</p><p>Run it only after setup, admin authorization, and the profile-security patch succeed.</p></header><div class="note"><strong>Read-only:</strong> this script does not modify data. It may report a notice for legacy profiles without a matching Auth user; those rows are left unchanged and skipped.</div><div class="toolbar"><button class="primary" id="copy" type="button" aria-label="Copy verifier SQL"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"></rect><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"></path></svg>Copy SQL</button><button id="download" type="button" aria-label="Download verifier SQL"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"></path><path d="m7 10 5 5 5-5"></path><path d="M5 21h14"></path></svg>Download .sql</button><span id="status" role="status" aria-live="polite"></span></div><textarea id="sql" readonly spellcheck="false" aria-label="Complete read-only Supabase verification SQL">-- Read-only post-setup checks for Q-A tables in the existing SmartPle project.
+-- Run after setup_shared_project.sql, then authorize_qa_admin.sql, in that order.
+-- This script does not modify data.
+
+do $$
+declare
+  v_table text;
+  v_relation oid;
+  v_rls boolean;
+  v_policy_count integer;
+  v_p4 bigint;
+  v_p5 bigint;
+  v_p6 bigint;
+  v_p7 bigint;
+  v_total bigint;
+  v_missing_profiles bigint;
+  v_auth_without_smartple bigint;
+  v_unlinked_profiles bigint;
+begin
+  -- Existing SmartPle profile source expected by the guarded Q-A sync RPCs.
+  if to_regclass('public.smartple_profiles') is null then
+    raise exception 'Missing public.smartple_profiles. Stop: this setup expects the student app schema.';
+  end if;
+  if not exists (select 1 from information_schema.columns where table_schema='public' and table_name='smartple_profiles' and column_name='user_id')
+     or not exists (select 1 from information_schema.columns where table_schema='public' and table_name='smartple_profiles' and column_name='display_name')
+     or not exists (select 1 from information_schema.columns where table_schema='public' and table_name='smartple_profiles' and column_name='class')
+     or not exists (select 1 from information_schema.columns where table_schema='public' and table_name='smartple_profiles' and column_name='role') then
+    raise exception 'smartple_profiles must include user_id, display_name, class, and role columns.';
+  end if;
+  select c.relrowsecurity into v_rls from pg_catalog.pg_class c where c.oid = 'public.smartple_profiles'::regclass;
+  if not coalesce(v_rls, false) then
+    raise exception 'Row-level security is not enabled on public.smartple_profiles. Apply secure_smartple_profiles.sql first.';
+  end if;
+  if to_regprocedure('public.smartple_profiles_admin_for_rls()') is null then
+    raise exception 'Missing scoped SmartPle admin helper public.smartple_profiles_admin_for_rls().';
+  end if;
+  if not exists (
+       select 1 from pg_catalog.pg_policies
+       where schemaname='public' and tablename='smartple_profiles'
+         and policyname='smartple_profiles_self_select' and cmd='SELECT'
+     )
+     or not exists (
+       select 1 from pg_catalog.pg_policies
+       where schemaname='public' and tablename='smartple_profiles'
+         and policyname='smartple_profiles_admin_update' and cmd='UPDATE'
+     ) then
+    raise exception 'Expected scoped student-read/admin-update policies on public.smartple_profiles; apply secure_smartple_profiles.sql.';
+  end if;
+  if exists (
+    select 1 from pg_catalog.pg_policies
+    where schemaname='public' and tablename='smartple_profiles'
+      and policyname in ('allow all','allow all profiles')
+  ) then
+    raise exception 'A broad allow-all policy remains on public.smartple_profiles.';
+  end if;
+  if has_table_privilege('anon','public.smartple_profiles','select')
+     or has_table_privilege('anon','public.smartple_profiles','insert')
+     or has_table_privilege('anon','public.smartple_profiles','update')
+     or has_table_privilege('anon','public.smartple_profiles','delete') then
+    raise exception 'The anon role still has direct privileges on public.smartple_profiles.';
+  end if;
+  if has_table_privilege('authenticated','public.smartple_profiles','insert')
+     or has_table_privilege('authenticated','public.smartple_profiles','delete') then
+    raise exception 'Authenticated clients must not directly insert/delete public.smartple_profiles.';
+  end if;
+
+  v_auth_without_smartple := (
+    select count(*) from auth.users u
+    left join public.smartple_profiles p on p.user_id = u.id
+    where p.user_id is null
+  );
+  if v_auth_without_smartple &gt; 0 then
+    raise notice '% Auth user(s) have no SmartPle profile row.', v_auth_without_smartple;
+  end if;
+
+  select count(*) into v_unlinked_profiles
+  from public.smartple_profiles s
+  where s.role in ('student','admin')
+    and (s.user_id is null or not exists (select 1 from auth.users u where u.id = s.user_id));
+  if v_unlinked_profiles &gt; 0 then
+    raise notice '% legacy SmartPle profile(s) have no matching Auth user_id; they were skipped and cannot sign in through Q-A until linked to a real Auth user.', v_unlinked_profiles;
+  end if;
+
+  if to_regprocedure('public.daily_qa_sync_my_profile()') is null then
+    raise exception 'Missing caller-scoped profile sync RPC public.daily_qa_sync_my_profile().';
+  end if;
+  if to_regprocedure('public.daily_qa_sync_profiles()') is null then
+    raise exception 'Missing admin-only roster sync RPC public.daily_qa_sync_profiles().';
+  end if;
+
+  if to_regclass('public.daily_qa_profiles') is null then
+    raise exception 'Missing public.daily_qa_profiles mapping table.';
+  end if;
+
+  v_missing_profiles := (
+    select count(*)
+    from public.smartple_profiles s
+    left join public.daily_qa_profiles q on q.user_id = s.user_id
+    where s.role in ('student','admin')
+      and exists (select 1 from auth.users u where u.id = s.user_id)
+      and q.user_id is null
+  );
+  if v_missing_profiles &gt; 0 then
+    raise exception '% SmartPle profile(s) have not been mapped into Q-A profiles.', v_missing_profiles;
+  end if;
+  if has_table_privilege('authenticated', 'public.daily_qa_profiles', 'insert')
+     or has_table_privilege('authenticated', 'public.daily_qa_profiles', 'update')
+     or has_table_privilege('authenticated', 'public.daily_qa_profiles', 'delete') then
+    raise exception 'Authenticated clients must not directly write daily_qa_profiles.';
+  end if;
+
+  -- Q-A admin allowlist is only managed in SQL Editor, not through the client API.
+  if to_regclass('public.daily_qa_admins') is null then
+    raise exception 'Missing protected public.daily_qa_admins allowlist.';
+  end if;
+  select c.relrowsecurity into v_rls from pg_catalog.pg_class c where c.oid = 'public.daily_qa_admins'::regclass;
+  if not coalesce(v_rls, false) then
+    raise exception 'Row-level security is not enabled on public.daily_qa_admins.';
+  end if;
+  if has_table_privilege('authenticated', 'public.daily_qa_admins', 'select')
+     or has_table_privilege('authenticated', 'public.daily_qa_admins', 'insert')
+     or has_table_privilege('authenticated', 'public.daily_qa_admins', 'update')
+     or has_table_privilege('authenticated', 'public.daily_qa_admins', 'delete') then
+    raise exception 'Authenticated clients must not have direct privileges on daily_qa_admins.';
+  end if;
+  if not exists (
+    select 1
+    from public.daily_qa_admins a
+    join public.daily_qa_profiles q on q.user_id = a.user_id
+    join public.smartple_profiles s on s.user_id = a.user_id
+    where q.role = 'admin' and s.role = 'admin'
+  ) then
+    raise exception 'No Q-A admin is authorized. Add an existing SmartPle admin to daily_qa_admins in SQL Editor.';
+  end if;
+
+  foreach v_table in array array[
+    'daily_qa_profiles',
+    'daily_qa_questions',
+    'daily_qa_global_settings',
+    'daily_qa_class_settings',
+    'daily_qa_settings',
+    'daily_qa_assignments',
+    'daily_qa_assignment_items'
+  ] loop
+    v_relation := to_regclass(format('public.%I', v_table))::oid;
+    if v_relation is null then
+      raise exception 'Missing table public.%', v_table;
+    end if;
+
+    select c.relrowsecurity
+      into v_rls
+      from pg_catalog.pg_class c
+     where c.oid = v_relation;
+    if not coalesce(v_rls, false) then
+      raise exception 'Row-level security is not enabled on public.%', v_table;
+    end if;
+
+    select count(*)
+      into v_policy_count
+      from pg_catalog.pg_policies p
+     where p.schemaname = 'public'
+       and p.tablename = v_table;
+    if v_policy_count = 0 then
+      raise exception 'No RLS policies found for public.%', v_table;
+    end if;
+  end loop;
+
+  select count(*) into v_p4 from public.daily_qa_questions where grade = 'P4' and subject = 'Science' and is_active;
+  select count(*) into v_p5 from public.daily_qa_questions where grade = 'P5' and subject = 'Science' and is_active;
+  select count(*) into v_p6 from public.daily_qa_questions where grade = 'P6' and subject = 'Science' and is_active;
+  select count(*) into v_p7 from public.daily_qa_questions where grade = 'P7' and subject = 'Science' and is_active;
+  v_total := v_p4 + v_p5 + v_p6 + v_p7;
+
+  if v_p4 &lt; 160 then raise exception 'Expected at least 160 active P4 Science items; found %', v_p4; end if;
+  if v_p5 &lt; 180 then raise exception 'Expected at least 180 active P5 Science items; found %', v_p5; end if;
+  if v_p6 &lt; 200 then raise exception 'Expected at least 200 active P6 Science items; found %', v_p6; end if;
+  if v_p7 &lt; 120 then raise exception 'Expected at least 120 active P7 Science items; found %', v_p7; end if;
+
+  if not exists (select 1 from public.daily_qa_global_settings where id = true) then
+    raise exception 'The global daily-target row is missing.';
+  end if;
+  if to_regprocedure('public.daily_qa_is_admin()') is null then
+    raise exception 'Missing Q-A admin gate public.daily_qa_is_admin().';
+  end if;
+  if to_regprocedure('public.daily_qa_effective_target()') is null then
+    raise exception 'Missing target resolver public.daily_qa_effective_target().';
+  end if;
+  if to_regprocedure('public.daily_qa_get_or_start_set()') is null then
+    raise exception 'Missing RPC public.daily_qa_get_or_start_set().';
+  end if;
+  if to_regprocedure('public.daily_qa_complete_item(uuid,text)') is null then
+    raise exception 'Missing RPC public.daily_qa_complete_item(uuid,text).';
+  end if;
+
+  raise notice 'Q-A checks passed: P4 %, P5 %, P6 %, P7 % active Science questions (% total); shared profiles/admin allowlist found; smartple_profiles RLS is scoped; anon profile access is blocked; RLS/policies found for all seven Q-A data tables.', v_p4, v_p5, v_p6, v_p7, v_total;
+end;
+$$;
+</textarea><footer>If clipboard access is blocked, click inside the SQL box, press Ctrl+A (or ⌘A), then Ctrl+C (or ⌘C).</footer></main>
+<script>
+const box=document.getElementById('sql'),status=document.getElementById('status');
+function say(t){status.textContent=t;}
+document.getElementById('copy').addEventListener('click',async()=>{try{await navigator.clipboard.writeText(box.value);say('Copied the read-only verifier SQL.');}catch(_){box.focus();box.select();box.setSelectionRange(0,box.value.length);try{if(document.execCommand('copy'))say('Copied the read-only verifier SQL.');else say('SQL selected; press Ctrl+C or ⌘C to copy.');}catch(__){say('SQL selected; press Ctrl+C or ⌘C to copy.');}}});
+document.getElementById('download').addEventListener('click',()=>{const blob=new Blob([box.value],{type:'text/sql;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='verify_daily_qa.sql';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);say('Download started.');});
+</script></body></html>
